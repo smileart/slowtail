@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"os"
@@ -29,7 +30,15 @@ const doc = `Slow Tail 🐕
                            Keep in mind: you can't rewind STDIN but you can skip <n>
                            lines from the beginning using this option`
 
-func eachLine(filePath string, callback func(lineNum int, line string) error) (linesRead int, err error) {
+type Options struct {
+	rewindLines       int
+	delayMilliseconds int
+	filePath          string
+}
+
+var globalDelay = 0
+
+func eachFileLine(filePath string, callback func(lineNum int, line string) error) (linesRead int, err error) {
 	file, err := os.Open(filePath)
 
 	if err != nil {
@@ -58,6 +67,23 @@ func eachLine(filePath string, callback func(lineNum int, line string) error) (l
 	return lineNum, nil
 }
 
+func tailFile(filePath string, linesCount int) {
+	totalLinesCount, err := eachFileLine(filePath, func(lineNum int, line string) error { return nil })
+	linesToTail := int(math.Abs(float64(linesCount - totalLinesCount)))
+
+	if err == nil {
+		eachFileLine(filePath, func(lineNum int, line string) error {
+			if lineNum >= linesToTail {
+				fmt.Println(line)
+			}
+
+			return nil
+		})
+	} else {
+		checkErr(err)
+	}
+}
+
 func checkErr(err error) {
 	if err != nil {
 		log.Fatal("ERROR: ", err)
@@ -66,7 +92,6 @@ func checkErr(err error) {
 
 func isStdinPath(filePath string) bool {
 	stat, _ := os.Stdin.Stat()
-	// fmt.Println(stat.Mode())
 	if (stat.Mode() & os.ModeCharDevice) == 0 {
 		return true
 	}
@@ -76,71 +101,88 @@ func isStdinPath(filePath string) bool {
 
 func sleepMilliseconds(ms int) {
 	time.Sleep(time.Duration(ms) * time.Millisecond)
-	// fmt.Printf("I'll sleep for %vms\n", ms)
+}
+
+func parseArgs(args map[string]interface{}) Options {
+	rewindLines := int(0)
+	delayMilliseconds := int(250)
+	filePath := ""
+
+	if rewindArg, ok := args["--rewind"].(string); ok {
+		rewindLines, _ = strconv.Atoi(rewindArg)
+	}
+
+	if delayArg, ok := args["--delay"].(string); ok {
+		delayMilliseconds, _ = strconv.Atoi(delayArg)
+	}
+
+	if filePathArg, ok := args["<file>"].(string); ok {
+		filePath = filePathArg
+	}
+
+	return Options{
+		rewindLines,
+		delayMilliseconds,
+		filePath,
+	}
+}
+
+func stdinToChan(source io.Reader, linesChannel *chan string, rewindLinesCount int) {
+	readline.ReadLine(os.Stdin, func(line string) {
+		*linesChannel <- line
+
+		if rewindLinesCount == 0 {
+			sleepMilliseconds(globalDelay)
+		}
+
+		if rewindLinesCount > 0 {
+			rewindLinesCount--
+		}
+	})
+
+	close(*linesChannel)
+}
+
+func fileToChan(source string, linesChannel *chan string, rewindLinesCount int) {
+	if rewindLinesCount > 0 {
+		tailFile(source, rewindLinesCount)
+	}
+
+	t, err := tail.TailFile(source, tail.Config{
+		Follow:   true,
+		Poll:     true,
+		Location: &tail.SeekInfo{Offset: 0, Whence: 2},
+		Logger:   tail.DiscardingLogger,
+	})
+
+	if err == nil {
+		for line := range t.Lines {
+			*linesChannel <- line.Text
+			sleepMilliseconds(globalDelay)
+		}
+	} else {
+		close(*linesChannel)
+		checkErr(err)
+	}
 }
 
 func main() {
 	arguments, _ := docopt.Parse(doc, nil, true, version, false)
-	fmt.Println(arguments)
 
-	rewindLines := int(0)
-	delayMilliseconds := int(250)
+	options := parseArgs(arguments)
+	globalDelay = options.delayMilliseconds
 
-	if rewindArg, ok := arguments["--rewind"].(string); ok {
-		rewindLines, _ = strconv.Atoi(rewindArg)
-	}
+	if len(options.filePath) > 0 {
+		linesChannel := make(chan string, 1)
 
-	if delay, ok := arguments["--delay"].(string); ok {
-		delayMilliseconds, _ = strconv.Atoi(delay)
-	}
-
-	if filePath, ok := arguments["<file>"].(string); ok {
-		fmt.Println(isStdinPath(filePath))
-
-		if isStdinPath(filePath) {
-			readline.ReadLine(os.Stdin, func(line string) {
-				fmt.Printf("%s\n", line)
-				if rewindLines == 0 {
-					sleepMilliseconds(delayMilliseconds)
-				}
-
-				if rewindLines > 0 {
-					rewindLines--
-				}
-			})
+		if isStdinPath(options.filePath) {
+			go stdinToChan(os.Stdin, &linesChannel, options.rewindLines)
 		} else {
-			if rewindLines > 0 {
-				linesCount, err := eachLine(filePath, func(lineNum int, line string) error { return nil })
-				linesCount = int(math.Abs(float64(rewindLines - linesCount)))
+			go fileToChan(options.filePath, &linesChannel, options.rewindLines)
+		}
 
-				if err == nil {
-					eachLine(filePath, func(lineNum int, line string) error {
-						if lineNum >= linesCount {
-							fmt.Println(line)
-						}
-
-						return nil
-					})
-				} else {
-					checkErr(err)
-				}
-			}
-
-			t, err := tail.TailFile(filePath, tail.Config{
-				Follow:   true,
-				Poll:     true,
-				Location: &tail.SeekInfo{Offset: 0, Whence: 2},
-				Logger:   tail.DiscardingLogger,
-			})
-
-			if err == nil {
-				for line := range t.Lines {
-					fmt.Println(line.Text)
-					sleepMilliseconds(delayMilliseconds)
-				}
-			} else {
-				checkErr(err)
-			}
+		for line := range linesChannel {
+			fmt.Println(line)
 		}
 	}
 }
