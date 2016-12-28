@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/docopt/docopt-go"
+	"github.com/fatih/color"
 	"github.com/hpcloud/tail"
 	"github.com/jprichardson/readline-go"
 )
@@ -30,7 +32,7 @@ const doc = `Slow Tail 🐕
                            Keep in mind: you can't rewind STDIN but you can skip <n>
                            lines from the beginning using this option`
 
-type Options struct {
+type options struct {
 	rewindLines       int
 	delayMilliseconds int
 	filePath          string
@@ -86,7 +88,7 @@ func tailFile(filePath string, linesCount int) {
 
 func checkErr(err error) {
 	if err != nil {
-		log.Fatal("ERROR: ", err)
+		log.Fatal(color.RedString("ERROR: "), color.RedString(err.Error()))
 	}
 }
 
@@ -103,7 +105,8 @@ func sleepMilliseconds(ms int) {
 	time.Sleep(time.Duration(ms) * time.Millisecond)
 }
 
-func parseArgs(args map[string]interface{}) Options {
+func parseArgs(args map[string]interface{}) (options, error) {
+
 	rewindLines := int(0)
 	delayMilliseconds := int(250)
 	filePath := ""
@@ -112,19 +115,27 @@ func parseArgs(args map[string]interface{}) Options {
 		rewindLines, _ = strconv.Atoi(rewindArg)
 	}
 
+	if rewindLines < 0 || rewindLines > math.MaxInt32 {
+		return options{}, errors.New("--rewind must be a positive number of lines")
+	}
+
 	if delayArg, ok := args["--delay"].(string); ok {
 		delayMilliseconds, _ = strconv.Atoi(delayArg)
+	}
+
+	if delayMilliseconds < 0 || delayMilliseconds > math.MaxInt32 {
+		return options{}, errors.New("--delay must be a positive number of milliseconds")
 	}
 
 	if filePathArg, ok := args["<file>"].(string); ok {
 		filePath = filePathArg
 	}
 
-	return Options{
+	return options{
 		rewindLines,
 		delayMilliseconds,
 		filePath,
-	}
+	}, nil
 }
 
 func stdinToChan(source io.Reader, linesChannel *chan string, rewindLinesCount int) {
@@ -169,7 +180,12 @@ func fileToChan(source string, linesChannel *chan string, rewindLinesCount int) 
 func main() {
 	arguments, _ := docopt.Parse(doc, nil, true, version, false)
 
-	options := parseArgs(arguments)
+	options, err := parseArgs(arguments)
+
+	if err != nil {
+		checkErr(err)
+	}
+
 	globalDelay = options.delayMilliseconds
 
 	if len(options.filePath) > 0 {
