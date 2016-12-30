@@ -9,12 +9,14 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	docopt "github.com/docopt/docopt-go"
 	color "github.com/fatih/color"
 	tail "github.com/hpcloud/tail"
 	readline "github.com/jprichardson/readline-go"
+	termbox "github.com/nsf/termbox-go"
 )
 
 const version = "Slow Tail v0.1"
@@ -22,11 +24,14 @@ const version = "Slow Tail v0.1"
 const doc = `Slow Tail 🐕
 
   Usage:
-    slowtail [--delay=<ms>] [--rewind=<n>] <file>
+    slowtail [--delay=<ms>] [--rewind=<n>] [--interactive] [--porcelain] <file>
     slowtail --help
     slowtail --version
 
   Options:
+    --interactive, -i      Interactive mode ( ⬆⬇ to make the flow faster/slower )
+    --porcelain, -p        Human friendly output in interactive mode 🚽
+                           Beware: output shouldn't be used with other commands!
     --delay=<ms>, -d=<ms>  Delay in milliseconds [default: 250]
     --rewind=<n>, -r=<n>   Rewind <n> lines back from the end of file [default: 0]
                            Keep in mind: you can't rewind STDIN but you can skip <n>
@@ -39,10 +44,13 @@ type arguments struct {
 }
 
 var globalDelay = 0
+var globalDelayMutex = &sync.Mutex{}
 
 func main() {
-	args, _ := docopt.Parse(doc, nil, true, version, false)
+	linesChannel := make(chan string, 1)
+	readyChannel := make(chan bool, 1)
 
+	args, _ := docopt.Parse(doc, nil, true, version, false)
 	options, err := parseArgs(args)
 
 	if err != nil {
@@ -52,9 +60,13 @@ func main() {
 	globalDelay = options.delayMilliseconds
 
 	if len(options.filePath) > 0 {
-		linesChannel := make(chan string, 1)
+		if args["--interactive"] == true {
+			go interactiveMode(&readyChannel, args["--porcelain"] == true)
+		} else {
+			readyChannel <- true
+		}
 
-		if isStdin() {
+		if isStdin() && <-readyChannel {
 			go stdinToChan(os.Stdin, &linesChannel, options.rewindLines)
 		} else {
 			go fileToChan(options.filePath, &linesChannel, options.rewindLines)
@@ -141,12 +153,11 @@ func fileToChan(source string, linesChannel *chan string, rewindLinesCount int) 
 
 func eachFileLine(filePath string, callback func(lineNum int, line string) error) (linesRead int, err error) {
 	file, err := os.Open(filePath)
+	defer file.Close()
 
 	if err != nil {
 		return 0, err
 	}
-
-	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
 	lineNum := 0
@@ -182,6 +193,96 @@ func tailFile(filePath string, linesCount int) {
 		})
 	} else {
 		checkErr(err)
+	}
+}
+
+func interactiveMode(readyChannel *chan (bool), humanFriendly bool) {
+	err := termbox.Init()
+	if err != nil {
+		checkErr(err)
+	}
+
+	termbox.SetInputMode(termbox.InputCurrent)
+	termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
+
+	*readyChannel <- true
+
+	for {
+		switch ev := termbox.PollEvent(); ev.Type {
+		case termbox.EventKey:
+			if ev.Key == termbox.KeyArrowDown {
+				changeSpeed(true, humanFriendly)
+			}
+
+			if ev.Key == termbox.KeyArrowUp {
+				changeSpeed(false, humanFriendly)
+			}
+
+			if ev.Key == termbox.KeyCtrlC {
+				termbox.Flush()
+				termbox.Close()
+				os.Exit(0)
+			}
+		case termbox.EventError:
+			checkErr(ev.Err)
+		}
+	}
+}
+
+func speedMessage(down bool) string {
+	direction := "faster"
+	if down == true {
+		direction = "slower"
+	}
+
+	globalDelayMutex.Lock()
+	defer globalDelayMutex.Unlock()
+
+	w, _ := termbox.Size()
+	var format string
+	realTimeMsg := "Working in real-time…"
+
+	switch {
+	case w >= 70:
+		format = "━━━━━━━━━━━━━━━━ Going %v (delay: %[2]v ms) ━━━━━━━━━━━━━━━━"
+		realTimeMsg = "━━━━━━━━━━━━━━━━━━━ " + realTimeMsg + " ━━━━━━━━━━━━━━━━━━━"
+	case w < 70 && w >= 55:
+		format = "━━━━━━━━━ Going %v (delay: %[2]v ms) ━━━━━━━━━"
+		realTimeMsg = "━━━━━━━━━━━ " + realTimeMsg + " ━━━━━━━━━━━"
+	case w < 55 && w >= 40:
+		format = "━━ Going %v (delay: %[2]v ms) ━━"
+		realTimeMsg = "━━ " + realTimeMsg + " ━━"
+	case w < 40 && w >= 20:
+		format = "━ %[2]v ms ━"
+		realTimeMsg = "━━━ RT ━━━"
+	default:
+		return ""
+	}
+
+	if globalDelay > 0 {
+		return fmt.Sprintf(format, direction, globalDelay)
+	}
+
+	return realTimeMsg
+}
+
+func changeSpeed(down bool, humanFriendly bool) {
+	if down {
+		if globalDelay < math.MaxInt32-250 {
+			globalDelayMutex.Lock()
+			globalDelay += 250
+			globalDelayMutex.Unlock()
+		}
+	} else {
+		globalDelayMutex.Lock()
+		if globalDelay-250 >= 0 {
+			globalDelay -= 250
+		}
+		globalDelayMutex.Unlock()
+	}
+
+	if humanFriendly {
+		fmt.Println(speedMessage(down))
 	}
 }
 
