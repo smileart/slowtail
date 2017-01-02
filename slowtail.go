@@ -15,7 +15,6 @@ import (
 	docopt "github.com/docopt/docopt-go"
 	color "github.com/fatih/color"
 	tail "github.com/hpcloud/tail"
-	readline "github.com/jprichardson/readline-go"
 	termbox "github.com/nsf/termbox-go"
 )
 
@@ -41,6 +40,8 @@ type arguments struct {
 	rewindLines       int
 	delayMilliseconds int
 	filePath          string
+	porcelain         bool
+	interactive       bool
 }
 
 var globalDelay = 0
@@ -59,33 +60,42 @@ func main() {
 
 	globalDelay = options.delayMilliseconds
 
-	if len(options.filePath) > 0 {
-		if args["--interactive"] == true {
-			go interactiveMode(&readyChannel, args["--porcelain"] == true)
-		} else {
-			readyChannel <- true
-		}
+	if options.interactive == true {
+		go interactiveMode(&readyChannel, options.porcelain == true)
+	} else {
+		readyChannel <- true
+	}
 
-		if isStdin() && <-readyChannel {
+	if <-readyChannel {
+		if isStdin() {
 			go stdinToChan(os.Stdin, &linesChannel, options.rewindLines)
 		} else {
 			go fileToChan(options.filePath, &linesChannel, options.rewindLines)
 		}
+	}
 
-		for line := range linesChannel {
-			fmt.Println(line)
-		}
+	for line := range linesChannel {
+		fmt.Println(line)
 	}
 }
 
 func parseArgs(args map[string]interface{}) (arguments, error) {
-
 	rewindLines := int(0)
 	delayMilliseconds := int(250)
 	filePath := ""
+	porcelain := false
+	interactive := false
 
 	if rewindArg, ok := args["--rewind"].(string); ok {
 		rewindLines, _ = strconv.Atoi(rewindArg)
+	}
+
+	if porcelainArg, ok := args["--porcelain"].(bool); ok {
+		porcelain = porcelainArg
+	}
+
+	if interactiveArg, ok := args["--interactive"].(bool); ok {
+		interactive = interactiveArg
 	}
 
 	if rewindLines < 0 || rewindLines > math.MaxInt32 {
@@ -108,27 +118,33 @@ func parseArgs(args map[string]interface{}) (arguments, error) {
 		rewindLines,
 		delayMilliseconds,
 		filePath,
+		porcelain,
+		interactive,
 	}, nil
 }
 
 func stdinToChan(source io.Reader, linesChannel *chan string, rewindLinesCount int) {
-	defer close(*linesChannel)
+	scanner := bufio.NewScanner(source)
 
-	readline.ReadLine(os.Stdin, func(line string) {
-		*linesChannel <- line
+	for scanner.Scan() {
+		*linesChannel <- scanner.Text()
 
-		if rewindLinesCount == 0 {
+		if rewindLinesCount == 1 {
 			sleepMilliseconds(globalDelay)
 		}
 
 		if rewindLinesCount > 0 {
 			rewindLinesCount--
 		}
-	})
+	}
 }
 
 func fileToChan(source string, linesChannel *chan string, rewindLinesCount int) {
 	defer close(*linesChannel)
+
+	if _, err := os.Stat(source); os.IsNotExist(err) {
+		checkErr(err)
+	}
 
 	if rewindLinesCount > 0 {
 		tailFile(source, rewindLinesCount)
@@ -141,13 +157,13 @@ func fileToChan(source string, linesChannel *chan string, rewindLinesCount int) 
 		Logger:   tail.DiscardingLogger,
 	})
 
-	if err == nil {
-		for line := range t.Lines {
-			*linesChannel <- line.Text
-			sleepMilliseconds(globalDelay)
-		}
-	} else {
+	if err != nil {
 		checkErr(err)
+	}
+
+	for line := range t.Lines {
+		*linesChannel <- line.Text
+		sleepMilliseconds(globalDelay)
 	}
 }
 
@@ -219,9 +235,8 @@ func interactiveMode(readyChannel *chan (bool), humanFriendly bool) {
 			}
 
 			if ev.Key == termbox.KeyCtrlC {
-				termbox.Flush()
-				termbox.Close()
-				os.Exit(0)
+				quitInteracitve(humanFriendly)
+				break
 			}
 		case termbox.EventError:
 			checkErr(ev.Err)
@@ -244,13 +259,13 @@ func speedMessage(down bool) string {
 
 	switch {
 	case w >= 70:
-		format = "━━━━━━━━━━━━━━━━ Going %v (delay: %[2]v ms) ━━━━━━━━━━━━━━━━"
+		format = "━━━━━━━━━━━━━━━━ Going %[1]v (delay: %[2]v ms) ━━━━━━━━━━━━━━━━"
 		realTimeMsg = "━━━━━━━━━━━━━━━━━━━ " + realTimeMsg + " ━━━━━━━━━━━━━━━━━━━"
 	case w < 70 && w >= 55:
-		format = "━━━━━━━━━ Going %v (delay: %[2]v ms) ━━━━━━━━━"
+		format = "━━━━━━━━━ Going %[1]v (delay: %[2]v ms) ━━━━━━━━━"
 		realTimeMsg = "━━━━━━━━━━━ " + realTimeMsg + " ━━━━━━━━━━━"
 	case w < 55 && w >= 40:
-		format = "━━ Going %v (delay: %[2]v ms) ━━"
+		format = "━━ Going %[1]v (delay: %[2]v ms) ━━"
 		realTimeMsg = "━━ " + realTimeMsg + " ━━"
 	case w < 40 && w >= 20:
 		format = "━ %[2]v ms ━"
@@ -286,13 +301,26 @@ func changeSpeed(down bool, humanFriendly bool) {
 	}
 }
 
-func isStdin() bool {
-	stat, _ := os.Stdin.Stat()
-	if (stat.Mode() & os.ModeCharDevice) == 0 {
-		return true
+func quitInteracitve(humanFriendly bool) {
+	termbox.Flush()
+	termbox.Close()
+
+	if humanFriendly {
+		fmt.Println("Press Ctrl+C to exit…")
 	}
 
-	return false
+	os.Stdout.Close()
+	os.Stdin.Close()
+}
+
+func isStdin() bool {
+	stat, _ := os.Stdin.Stat()
+
+	if (stat.Mode() & os.ModeCharDevice) == os.ModeCharDevice {
+		return false
+	}
+
+	return true
 }
 
 func checkErr(err error) {
