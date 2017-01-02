@@ -129,7 +129,7 @@ func stdinToChan(source io.Reader, linesChannel *chan string, rewindLinesCount i
 	for scanner.Scan() {
 		*linesChannel <- scanner.Text()
 
-		if rewindLinesCount == 1 {
+		if rewindLinesCount <= 0 {
 			sleepMilliseconds(globalDelay)
 		}
 
